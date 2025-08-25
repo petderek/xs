@@ -249,48 +249,8 @@
 (define (secret name values)
   (OpaqueSecret "v1" "Secret" (metadata name) values))
 
+;; note - you should put data in 'data.rkt' such that when executed, it returns a stream of K8S objects
+;; check out 'data.rkt.example'
+(compile-to-yaml (include "data.rkt"))
 
-(define cert-annotations (hash "cert-manager.io/cluster-issuer" "letsencrypt"))
-(define auth-annotations (hash "nginx.ingress.kubernetes.io/auth-url" "test"
-                               "nginx.ingress.kubernetes.io/auth-signin" "test"))
 
-
-;; Predefined in helm:
-;; - cert-manager
-;; - ingress-nginx
-;; - portainer
-;; - openebs
-(compile-to-yaml
- (with-namespace "default"
-   (with-namespace "cert-manager"
-     (letsencryptroute53 "letsencrypt"
-                         "email"
-                         "acme-private-key"
-                         "us-east-1"
-                         "dns-user-secret"))
-   (with-annotations cert-annotations
-     ;; TLS ingress paths
-     (with-namespace "portainer"
-       (ingress "portainer" "nginx" (IngressRule "example.com" (IngressPath "/" "Prefix" (IngressBackend "portainer" 9000))) (IngressTLS "example.com" "portainer")))
-     (ingress "login" "nginx"
-              (IngressRule "example.com" (list
-                                            (IngressPath "/" "Prefix" (IngressBackend "login" 80))
-                                            (IngressPath "/oauth2" "Prefix" (IngressBackend "oauth" 80))))
-              (IngressTLS "example.com" "login"))
-     (ingress "kubernetes" "nginx" (IngressRule "example.com" (IngressPath "/" "Prefix" (IngressBackend "diagrams" 80))) (IngressTLS "example.com" "kubernetes"))
-     (with-annotations auth-annotations
-       ;; TLS auth ingress pathss
-       (ingress "diagrams" "nginx"
-                (IngressRule "example.com" (IngressPath "/" "Prefix" (IngressBackend "diagrams" 80))) (IngressTLS "example.com" "diagrams"))))
-   (service "login" (Port 80 1411))
-   (configmap "login"
-              "APP_URL" "example.com"
-              "TRUST_PROXY" "false"
-              "PUID" "1000"
-              "PGID" "1000")
-   (deployment "login"
-               (container "pocket-id" "ghcr.io/pocket-id/pocket-id:v1" (ContainerPort 1411 1411) (configmap "login")))
-   (service "oauth" (Port 80 4180))
-   (service "diagrams" (Port 80 8080))
-   (deployment "diagrams"
-               (container "diagrams" "plantuml/plantuml-server:jetty" (ContainerPort 8080 8080) #f))))

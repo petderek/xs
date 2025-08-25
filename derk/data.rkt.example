@@ -1,0 +1,11 @@
+(let ([cert-annotations (hash "cert-manager.io/cluster-issuer" "letsencrypt")])
+ (with-namespace "default"
+   (with-annotations cert-annotations
+     (ingress "diagrams"
+              "nginx"
+              (IngressRule "diagrams.example.com"
+                           (IngressPath "/" "Prefix" (IngressBackend "diagrams" 80)))
+              (IngressTLS "diagrams.example.com" "diagrams")))
+   (service "diagrams" (Port 80 8080))
+   (deployment "diagrams"
+               (container "diagrams" "plantuml/plantuml-server:jetty" (ContainerPort 8080 8080) #f))))

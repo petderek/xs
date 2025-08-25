@@ -1,0 +1,4 @@
+**/*.yaml
+**/*~
+.idea
+derk/data.rkt
