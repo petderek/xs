@@ -1,5 +1,6 @@
 #lang racket
 (require racket/hash)
+(require net/base64)
 (require yaml)
 
 
@@ -10,12 +11,19 @@
 (define current-labels (make-parameter #f))
 (define current-selector (make-parameter #f))
 (define current-annotations (make-parameter #f))
+(define current-env (make-parameter #f))
 
 (define-syntax-rule (with-annotations next body ...)
   (let* ([current (current-annotations)]
          [old (if current current (hash))]
          [merged (hash-union old next)])
     (parameterize ([current-annotations merged])
+      (list body ...))))
+(define-syntax-rule (with-env next body ...)
+  (let* ([current (current-env)]
+         [old (if current current (hash))]
+         [merged (hash-union old next)])
+    (parameterize ([current-env merged])
       (list body ...))))
 (define-syntax-rule (with-namespace ns body ...)
   (parameterize ([current-namespace ns])
@@ -29,6 +37,8 @@
 
 (define-values (prop:to-spec to-spec? to-spec-ref)
   (make-struct-type-property 'to-spec))
+(define-values (prop:data-key data-key? data-key-ref)
+  (make-struct-type-property 'data-key))
 
 (define (to-spec obj)
   (cond
@@ -36,13 +46,17 @@
     [(to-spec? obj) ((to-spec-ref obj) obj)]
     [else (error obj)]))
 
+(define (data-key obj)
+  (if (data-key? obj) (data-key-ref obj) (error obj)))
+
 (struct K8S (apiVersion kind metadata) #:transparent
+  #:property prop:data-key "spec"
   #:property prop:to-spec (lambda (self) (error "not supported")))
 (define (K8S->yaml contents)
   (hash "apiVersion" (K8S-apiVersion contents)
         "kind" (K8S-kind contents)
         "metadata" (K8S-metadata contents)
-        "spec" (to-spec contents)))
+        (data-key contents) (to-spec contents)))
 
 (define (metadata [name #f])
   (hash-filter-values
@@ -55,14 +69,17 @@
 (define (named-metadata name)
   (hash-union (hash "name" name) (metadata)))
 
+(define (get-name obj) (hash-ref (K8S-metadata obj) "name"))
+
 (struct ConfigMap K8S (data) #:transparent
+  #:property prop:data-key "data"
   #:property prop:to-spec (lambda (self) (ConfigMap-data self)))
 
-(define (configmap name config)
+(define (configmap name . rest)
   (ConfigMap "v1"
              "ConfigMap"
              (named-metadata name)
-             (hash "data" config)))
+             (apply hash rest)))
 
 (struct Port (listen target) #:transparent
   #:property prop:to-spec (lambda (self) (hash "port" (Port-listen self) "targetPort" (Port-target self))))
@@ -96,11 +113,24 @@
                             (hash "containerPort" (ContainerPort-port self)
                                   "hostPort" (ContainerPort-host self))))
 
-(struct Container (name image ports) #:transparent
+(define (infer-env-key obj)
+  (cond
+    [(ConfigMap? obj) "envFrom"]
+    [else "env"]))
+
+(define (infer-env obj)
+  (cond
+    [(ConfigMap? obj) (list (hash "configMapRef" (hash "name" (get-name obj))))]
+    [else 'null]))
+
+(struct Container (name image ports env) #:transparent
   #:property prop:to-spec
-  (lambda (self) (hash "name" (Container-name self)
-                       "image" (Container-image self)
-                       "ports" (as-list (to-spec (Container-ports self))))))
+  (lambda (self) (let ([envKey (infer-env-key (Container-env self))]
+                       [envValue (infer-env (Container-env self))])
+                   (hash "name" (Container-name self)
+                         "image" (Container-image self)
+                         envKey envValue
+                         "ports" (as-list (to-spec (Container-ports self)))))))
 
 (struct Deployment K8S (selector podtemplate) #:transparent
   #:property prop:to-spec
@@ -122,15 +152,15 @@
 
 (define (deployment name template)
   (let* ([selector (selector-or-name name)]
-         [updatedTemplate (PodTemplate selector (PodTemplate-containers template))]) 
+         [updatedTemplate (PodTemplate selector (PodTemplate-containers template))])
     (Deployment "apps/v1"
                 "Deployment"
                 (named-metadata name)
                 selector
                 updatedTemplate)))
 
-(define (container name image ports)
-  (PodTemplate #f (list (Container name image ports))))
+(define (container name image ports env)
+  (PodTemplate #f (list (Container name image ports env))))
 
 ;; ingress
 (struct Ingress K8S (classname rules tls) #:transparent
@@ -147,7 +177,7 @@
            [kind (if numericalPort "number" "name")])
       (hash "service" (hash "name" (IngressBackend-name self)
                             "port" (hash kind port))))))
-  
+
 (struct IngressRule (host paths) #:transparent
   #:property prop:to-spec (lambda (self)
                             (hash "host" (IngressRule-host self)
@@ -173,18 +203,94 @@
            class
            rules
            tls))
-                
 
-(define cert-annotations (hash "cert-manager.io/issuer" "letsencrypt"))
+(struct Route53Solver (region secretRef) #:transparent
+  #:property prop:to-spec
+  (lambda (self) (hash "dns01"
+                       (hash "route53"
+                             (hash "region" (Route53Solver-region self)
+                                   "accessKeyIDSecretRef" (hash "name" (Route53Solver-secretRef self)
+                                                                "key" "access-key-id")
+                                   "secretAccessKeySecretRef" (hash "name" (Route53Solver-secretRef self)
+                                                                    "key" "secret-access-key"))))))
+
+(struct LEClusterIssuer K8S (email acmesecret solvers) #:transparent
+  #:property prop:to-spec
+  (lambda (self) (hash "acme"
+                       (hash "server" "https://acme-v02.api.letsencrypt.org/directory"
+                             "email" (LEClusterIssuer-email self)
+                             "privateKeySecretRef" (hash "name" (LEClusterIssuer-acmesecret self))
+                             "solvers" (as-list (to-spec (LEClusterIssuer-solvers self)))))))
+
+(define (letsencryptroute53 name email acmesecret awsregion awssecret)
+  (LEClusterIssuer "cert-manager.io/v1"
+                   "ClusterIssuer"
+                   (metadata name)
+                   email
+                   acmesecret
+                   (Route53Solver awsregion awssecret)))
+
+;; convert string to base64
+(define (base64-encode-string in)
+  (bytes->string/utf-8
+   (base64-encode
+    (string->bytes/utf-8 in)
+    "")))
+
+(struct OpaqueSecret K8S (data) #:transparent
+  #:property prop:data-key "data"
+  #:property prop:to-spec
+  (lambda (self)
+    (for/hash ([k (in-hash-keys (OpaqueSecret-data self))]
+               [v (in-hash-values (OpaqueSecret-data self))])
+      (values k (base64-encode-string v)))))
+
+
+(define (secret name values)
+  (OpaqueSecret "v1" "Secret" (metadata name) values))
+
+
+(define cert-annotations (hash "cert-manager.io/cluster-issuer" "letsencrypt"))
 (define auth-annotations (hash "nginx.ingress.kubernetes.io/auth-url" "test"
                                "nginx.ingress.kubernetes.io/auth-signin" "test"))
 
+
+;; Predefined in helm:
+;; - cert-manager
+;; - ingress-nginx
+;; - portainer
+;; - openebs
 (compile-to-yaml
  (with-namespace "default"
+   (with-namespace "cert-manager"
+     (letsencryptroute53 "letsencrypt"
+                         "email"
+                         "acme-private-key"
+                         "us-east-1"
+                         "dns-user-secret"))
    (with-annotations cert-annotations
+     ;; TLS ingress paths
+     (with-namespace "portainer"
+       (ingress "portainer" "nginx" (IngressRule "example.com" (IngressPath "/" "Prefix" (IngressBackend "portainer" 9000))) (IngressTLS "example.com" "portainer")))
+     (ingress "login" "nginx"
+              (IngressRule "example.com" (list
+                                            (IngressPath "/" "Prefix" (IngressBackend "login" 80))
+                                            (IngressPath "/oauth2" "Prefix" (IngressBackend "oauth" 80))))
+              (IngressTLS "example.com" "login"))
+     (ingress "kubernetes" "nginx" (IngressRule "example.com" (IngressPath "/" "Prefix" (IngressBackend "diagrams" 80))) (IngressTLS "example.com" "kubernetes"))
      (with-annotations auth-annotations
-       (ingress "excalidraw" "nginx"
-                (IngressRule "example.com" (IngressPath "/" "Exact" (IngressBackend "excalidraw" 80))) (IngressTLS "host" "secret"))))
-   (service "excalidraw" (Port 80 80))
-   (deployment "excalidraw"
-               (container "excalidraw" "excalidraw/excalidraw:latest" (ContainerPort 80 10999)))))
+       ;; TLS auth ingress pathss
+       (ingress "diagrams" "nginx"
+                (IngressRule "example.com" (IngressPath "/" "Prefix" (IngressBackend "diagrams" 80))) (IngressTLS "example.com" "diagrams"))))
+   (service "login" (Port 80 1411))
+   (configmap "login"
+              "APP_URL" "example.com"
+              "TRUST_PROXY" "false"
+              "PUID" "1000"
+              "PGID" "1000")
+   (deployment "login"
+               (container "pocket-id" "ghcr.io/pocket-id/pocket-id:v1" (ContainerPort 1411 1411) (configmap "login")))
+   (service "oauth" (Port 80 4180))
+   (service "diagrams" (Port 80 8080))
+   (deployment "diagrams"
+               (container "diagrams" "plantuml/plantuml-server:jetty" (ContainerPort 8080 8080) #f))))
